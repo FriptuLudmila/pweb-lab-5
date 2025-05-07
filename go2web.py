@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# usage: go2web -u <URL> | go2web -s <search-term> | go2web -h
+# Usage: go2web -u <URL> | go2web -s <search-term> | go2web -h
 import argparse
 import socket
 import ssl
@@ -8,11 +8,19 @@ import json
 import os
 import hashlib
 import time
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 from bs4 import BeautifulSoup
+
+# Constants
+MAX_REDIRECTS = 5
+CACHE_VALIDITY_SECONDS = 3600  # 1 hour
+MAX_SEARCH_RESULTS = 10
+USER_AGENT = "Mozilla/5.0 (compatible; go2web/1.0)"
+SOCKET_TIMEOUT = 10  # prevents hanging on slow connections
 
 
 def parse_arguments():
+    # Parse command line arguments for go2web.
     parser = argparse.ArgumentParser(add_help=False, description='CLI tool for making HTTP requests')
     parser.add_argument('-h', '--help', action='store_true', help='Show this help message and exit')
     parser.add_argument('-u', '--url', help='Make an HTTP request to the specified URL')
@@ -41,6 +49,8 @@ def parse_arguments():
 
 
 def parse_url(url):
+    # Parses a URL into components needed for HTTP requests.
+
     if not url.startswith(('http://', 'https://')):
         url = 'https://' + url  # Default to HTTPS
 
@@ -54,20 +64,27 @@ def parse_url(url):
     return host, path + query, port, is_https
 
 
-def make_http_request(url, max_redirects=5):
+def make_http_request(url, max_redirects=MAX_REDIRECTS):
+    """
+    Make an HTTP request to the specified URL and return the HTTP response as a string
+    """
     redirects = 0
     original_url = url
 
     while redirects <= max_redirects:
         host, path, port, is_https = parse_url(url)
 
-        # Create a socket
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(10)  # Set a timeout
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM) # ipv4 adressing is used
+        s.settimeout(SOCKET_TIMEOUT) # creates TCP socket
 
         try:
             # Connect to the server
-            s.connect((host, port))
+            try:
+                s.connect((host, port))
+            except socket.gaierror:
+                raise Exception(f"Could not resolve host: {host}")
+            except socket.timeout:
+                raise Exception(f"Connection timed out for host: {host}")
 
             # Wrap socket with SSL if HTTPS
             if is_https:
@@ -79,7 +96,7 @@ def make_http_request(url, max_redirects=5):
                 f"GET {path} HTTP/1.1\r\n"
                 f"Host: {host}\r\n"
                 f"Accept: text/html, application/json\r\n"
-                f"User-Agent: go2web/1.0\r\n"
+                f"User-Agent: {USER_AGENT}\r\n"
                 f"Connection: close\r\n\r\n"
             )
 
@@ -120,6 +137,8 @@ def make_http_request(url, max_redirects=5):
                     continue
 
             return response_str
+        except Exception as e:
+            raise e
         finally:
             s.close()
 
@@ -127,6 +146,9 @@ def make_http_request(url, max_redirects=5):
 
 
 def parse_http_response(response):
+    """
+    Parse an HTTP response into a human-readable format and return human-readable content
+    """
     # Split headers and body
     headers_end = response.find('\r\n\r\n')
     if headers_end == -1:
@@ -143,13 +165,12 @@ def parse_http_response(response):
     content_type_match = re.search(r'Content-Type: (.*?)\r\n', headers, re.IGNORECASE)
     content_type = content_type_match.group(1) if content_type_match else ""
 
-    # Handle transfer encoding (especially chunked)
+    # Handle transfer encoding (chunked)
     transfer_encoding = re.search(r'Transfer-Encoding: (.*?)\r\n', headers, re.IGNORECASE)
     if transfer_encoding and 'chunked' in transfer_encoding.group(1).lower():
         body = decode_chunked(body)
 
-    # Handle Content-Encoding if needed (gzip, deflate)
-
+    # Handle Content-Encoding
     if 'text/html' in content_type.lower():
         # BeautifulSoup to parse HTML
         soup = BeautifulSoup(body, 'html.parser')
@@ -160,6 +181,8 @@ def parse_http_response(response):
 
         # Format the content
         formatted_content = format_html_content(soup)
+        if status_code != 0:
+            formatted_content = f"Status: {status_code}\n\n" + formatted_content
         return formatted_content
 
     elif 'application/json' in content_type.lower():
@@ -173,6 +196,9 @@ def parse_http_response(response):
 
 
 def decode_chunked(body):
+    """
+    Decode a chunked HTTP response body.
+    """
     decoded = ""
     pos = 0
 
@@ -204,55 +230,146 @@ def decode_chunked(body):
 
 
 def format_html_content(soup):
-    # Get text with some structure preservation
-    main_content = soup.find('main') or soup.find('body')
-
+    """
+    Format HTML content into a human-readable text representation.
+    """
     # Extract title
     title = soup.title.text.strip() if soup.title else "No Title"
+
+    # Text extraction
+    output_parts = [f"TITLE: {title}", ""]
 
     # Extract headings for structure
     headings = []
     for h in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
         level = int(h.name[1])
         indent = "  " * (level - 1)
-        headings.append(f"{indent}{h.get_text().strip()}")
+        text = h.get_text().strip()
+        if text:
+            headings.append(f"{indent}{text}")
 
-    # Extract paragraphs
-    paragraphs = []
-    for p in soup.find_all('p'):
-        text = p.get_text().strip()
-        if text:  # Skip empty paragraphs
-            paragraphs.append(text)
-
-    # Extract lists
-    lists = []
-    for lst in soup.find_all(['ul', 'ol']):
-        list_items = []
-        for item in lst.find_all('li'):
-            text = item.get_text().strip()
-            if text:
-                list_items.append(f"• {text}")
-        if list_items:
-            lists.append("\n".join(list_items))
-
-    # Combine all content
-    all_content = [f"TITLE: {title}", ""]
     if headings:
-        all_content.extend(["HEADINGS:", *headings, ""])
-    if paragraphs:
-        all_content.extend(["CONTENT:", *paragraphs])
-    if lists:
-        all_content.extend(["", "LISTS:"])
-        for lst in lists:
-            all_content.append(lst)
-            all_content.append("")
+        output_parts.extend(["HEADINGS:", *headings, ""])
 
-    return "\n\n".join(all_content)
+    # Get all text from all visible elements
+    content_parts = []
+    for element in soup.find_all(['p', 'div', 'span', 'a', 'li', 'td', 'th',
+                                  'strong', 'em', 'b', 'i', 'label', 'button',
+                                  'section', 'article', 'header', 'footer']):
+        text = element.get_text().strip()
+        if text and len(text) > 5:  # Skip very short content
+            # Simple deduplication - don't add exact matches
+            if not any(part == text for part in content_parts):
+                content_parts.append(text)
+
+    # Add content to output with sectioning
+    if content_parts:
+        output_parts.append("CONTENT:")
+        for part in content_parts:
+            output_parts.append(part)
+            output_parts.append("")  # Add spacing between content blocks
+
+    # Find images and their alt text or src
+    images = []
+    for img in soup.find_all('img'):
+        alt = img.get('alt', '').strip()
+        src = img.get('src', '').strip()
+        if alt and len(alt) > 3:  # important alt text
+            images.append(f"[Image: {alt}]")
+        elif src:
+            # Extract just the filename from src
+            filename = src.split('/')[-1].split('?')[0]
+            if filename:
+                images.append(f"[Image: {filename}]")
+
+    if images:
+        output_parts.extend(["", "IMAGES:"])
+        output_parts.extend(images)
+
+    # Extract links
+    links = []
+    for a in soup.find_all('a', href=True):
+        href = a.get('href')
+        text = a.get_text().strip()
+        if href and text and len(text) > 1:
+            # Only include links with text and handle relative links
+            if not href.startswith(('http://', 'https://')):
+                # Skip anchor links and javascript
+                if href.startswith('#') or href.startswith('javascript:'):
+                    continue
+            links.append(f"- {text}: {href}")
+
+    if links:
+        output_parts.extend(["", "LINKS:"])
+        output_parts.extend(links)
+
+    return "\n\n".join(output_parts)
+
+
+def extract_url_from_redirect(href):
+    """
+    Extract the actual URL from a search engine redirect URL.
+    """
+    if '/l/?uddg=' in href:
+        try:
+            href_parts = urlparse(href)
+            query_params = dict(param.split('=') for param in href_parts.query.split('&'))
+            if 'uddg' in query_params:
+                return unquote(query_params['uddg'])
+        except Exception:
+            pass
+    return href
+
+
+def process_search_results(results, soup, selector, title_selector=None, link_selector=None):
+    """
+    Process search results from HTML using CSS selectors.
+
+    Args:
+        results (list): Current list of results (title, url) tuples
+        soup (BeautifulSoup): The parsed HTML
+        selector (str): CSS selector for result containers
+        title_selector (str, optional): CSS selector for title element
+        link_selector (str, optional): CSS selector for link element
+
+    Returns: Updated list of results
+    """
+    for result in soup.select(selector):
+        # Extract title element
+        if title_selector:
+            title_elem = result.select_one(title_selector)
+            if not title_elem:
+                continue
+        else:
+            title_elem = result
+
+        # Extract link element
+        if link_selector:
+            link_elem = title_elem.select_one(link_selector)
+        else:
+            link_elem = title_elem.find('a')
+
+        if not link_elem or not link_elem.has_attr('href'):
+            continue
+
+        href = extract_url_from_redirect(link_elem['href'])
+        title = title_elem.get_text().strip()
+
+        if href and title and len(title) > 3:
+            if href not in [r[1] for r in results] and len(results) < MAX_SEARCH_RESULTS:
+                results.append((title, href))
+
+    return results
 
 
 def search(term):
+    """
+    Search the web using a search engine.
+
+    Args:term (list): Search terms as a list of strings
+
+    """
     search_term = '+'.join(term)
-    # Try a different DuckDuckGo endpoint that's more reliable
     url = f"https://duckduckgo.com/html/?q={search_term}"
 
     try:
@@ -265,7 +382,7 @@ def search(term):
 
         body = response[headers_end + 4:]
 
-        # Save the raw HTML for debugging if needed
+        # Raw HTML for debugging
         debug_path = os.path.join(get_cache_path(), "last_search_debug.html")
         with open(debug_path, 'w', encoding='utf-8') as f:
             f.write(body)
@@ -276,115 +393,49 @@ def search(term):
         # Find search results
         results = []
 
-        # Look for result containers in standard DuckDuckGo HTML structure
-        for result in soup.select('.result__body'):
-            title_elem = result.select_one('.result__title')
-            if not title_elem:
-                continue
+        # Method 1: Standard DuckDuckGo HTML structure
+        results = process_search_results(
+            results, soup, '.result__body', '.result__title', 'a'
+        )
 
-            link_elem = title_elem.find('a')
-            if not link_elem or not link_elem.has_attr('href'):
-                continue
-
-            href = link_elem['href']
-            title = link_elem.get_text().strip()
-
-            if href and title and len(title) > 3:
-                # Extract real URL from DuckDuckGo redirect URL
-                if '/l/?uddg=' in href:
-                    try:
-                        import urllib.parse
-                        href_parts = urllib.parse.urlparse(href)
-                        query_params = urllib.parse.parse_qs(href_parts.query)
-                        if 'uddg' in query_params:
-                            href = urllib.parse.unquote(query_params['uddg'][0])
-                    except:
-                        pass
-
-                if href not in [r[1] for r in results] and len(results) < 10:
-                    results.append((title, href))
-
-        # Alternative approach for DuckDuckGo HTML
+        # Method 2: Alternative DuckDuckGo HTML structure
         if not results:
-            for result in soup.select('.links_main'):
-                title_elem = result.select_one('a')
-                if not title_elem or not title_elem.has_attr('href'):
-                    continue
+            results = process_search_results(
+                results, soup, '.links_main', 'a'
+            )
 
-                href = title_elem['href']
-                title = title_elem.get_text().strip()
-
-                if href and title and len(title) > 3:
-                    if '/l/?uddg=' in href:
-                        try:
-                            import urllib.parse
-                            href_parts = urllib.parse.urlparse(href)
-                            query_params = urllib.parse.parse_qs(href_parts.query)
-                            if 'uddg' in query_params:
-                                href = urllib.parse.unquote(query_params['uddg'][0])
-                        except:
-                            pass
-
-                    if href not in [r[1] for r in results] and len(results) < 10:
-                        results.append((title, href))
-
-        # Simple approach - get all external links
+        # Method 3: Get all external links
         if not results:
             for a_tag in soup.find_all('a', href=True):
-                href = a_tag['href']
+                href = extract_url_from_redirect(a_tag['href'])
                 title = a_tag.get_text().strip()
-
-                # Process potential DuckDuckGo redirect URLs
-                if '/l/?uddg=' in href:
-                    try:
-                        import urllib.parse
-                        href_parts = urllib.parse.urlparse(href)
-                        query_params = urllib.parse.parse_qs(href_parts.query)
-                        if 'uddg' in query_params:
-                            href = urllib.parse.unquote(query_params['uddg'][0])
-                    except:
-                        pass
 
                 # Skip internal navigation, empty titles
                 if (title and len(title) > 3 and not title.isdigit() and
                         href and href.startswith(('http://', 'https://')) and
                         'duckduckgo.com' not in href and
                         href not in [r[1] for r in results] and
-                        len(results) < 10):
+                        len(results) < MAX_SEARCH_RESULTS):
                     results.append((title, href))
 
-        # If still no results, parse all links that look like external URLs
         if not results:
-            for a_tag in soup.find_all('a', href=True):
-                href = a_tag['href']
-                if href.startswith(('http://', 'https://')) and 'duckduckgo.com' not in href:
-                    title = a_tag.get_text().strip() or href
-                    if title and href not in [r[1] for r in results] and len(results) < 10:
-                        results.append((title, href))
-
-        if not results:
-            # Try using Google as fallback
+            # Google as fallback
             return google_search(term)
 
-        # Format the output
-        output = [f"Search Results for: {' '.join(term)}", ""]
-        for i, (title, url) in enumerate(results, 1):
-            output.append(f"{i}. {title}")
-            output.append(f"   URL: {url}")
-            output.append("")
+        # Format and return the results
+        return format_search_results(term, results)
 
-        # Save the results for later access
-        save_search_results([url for _, url in results])
-
-        output.append("To access a search result, use: go2web -u <URL> or go2web -u #<result-number>")
-
-        return '\n'.join(output)
     except Exception as e:
         return f"Error performing search: {e}"
 
 
 def google_search(term):
-    """Fallback to Google search if DuckDuckGo fails"""
+    """
+    Search the web using Google as a fallback.
+
+    Args:term (list): Search terms as a list of strings
+
+    """
     search_term = '+'.join(term)
     url = f"https://www.google.com/search?q={search_term}"
 
@@ -409,9 +460,8 @@ def google_search(term):
         with open(debug_path, 'w', encoding='utf-8') as f:
             f.write(body)
 
-        # Try to find search results
+        # Method 1: Google's standard result containers
         for result in soup.select('div.g'):
-            # Look for the title and link
             a_tag = result.select_one('a')
             if not a_tag or not a_tag.has_attr('href'):
                 continue
@@ -423,10 +473,11 @@ def google_search(term):
             title_elem = result.select_one('h3')
             title = title_elem.get_text().strip() if title_elem else a_tag.get_text().strip()
 
-            if title and href and len(title) > 3 and href not in [r[1] for r in results] and len(results) < 10:
+            if title and href and len(title) > 3 and href not in [r[1] for r in results] and len(
+                    results) < MAX_SEARCH_RESULTS:
                 results.append((title, href))
 
-        # Simplified approach if the above fails
+        # Method 2: Simplified approach for Google
         if not results:
             for a_tag in soup.find_all('a', href=True):
                 href = a_tag['href']
@@ -437,83 +488,52 @@ def google_search(term):
                     title = a_tag.get_text().strip() or href
                     if (title and len(title) > 3 and
                             href not in [r[1] for r in results] and
-                            len(results) < 10):
+                            len(results) < MAX_SEARCH_RESULTS):
                         results.append((title, href))
 
-        if not results:
-            # Hard-coded search results
-            results = [
-                ("Solar panel - Wikipedia", "https://en.wikipedia.org/wiki/Solar_panel"),
-                ("What is a Solar Panel? How Do Solar Panels Work?",
-                 "https://www.energysage.com/solar/solar-panels/how-solar-panels-work/"),
-                ("Solar Panel Kits at Lowes.com",
-                 "https://www.lowes.com/pl/Solar-panel-kits-Solar-panels-accessories-Outdoor-living/4294410759"),
-                ("What Are Solar Panels? How Do They Work? - NREL", "https://www.nrel.gov/research/re-solar.html"),
-                ("Solar Energy and Solar Power Facts - National Geographic",
-                 "https://www.nationalgeographic.com/environment/article/solar-power"),
-                ("Best Solar Panels of 2024 - Consumer Reports",
-                 "https://www.consumerreports.org/appliances/solar-panels/best-solar-panels-aac9732efd38/"),
-                ("Solar Panel Efficiency: What Factors Affect Output - EnergySage",
-                 "https://www.energysage.com/solar/solar-panels/solar-panel-efficiency/"),
-                ("How Solar Panels Work | Department of Energy",
-                 "https://www.energy.gov/eere/solar/how-solar-panels-work")
-            ]
+        # Format and return the results
+        return format_search_results(term, results)
 
-        # Format the output
-        output = [f"Search Results for: {' '.join(term)}", ""]
-        for i, (title, url) in enumerate(results, 1):
-            output.append(f"{i}. {title}")
-            output.append(f"   URL: {url}")
-            output.append("")
-
-        # Save the results for later access
-        save_search_results([url for _, url in results])
-
-        output.append("To access a search result, use: go2web -u <URL> or go2web -u #<result-number>")
-
-        return '\n'.join(output)
-    except Exception as e:
-        # If Google search fails, provide some fallback results
-        results = [
-            ("Solar panel - Wikipedia", "https://en.wikipedia.org/wiki/Solar_panel"),
-            ("What is a Solar Panel? How Do Solar Panels Work?",
-             "https://www.energysage.com/solar/solar-panels/how-solar-panels-work/"),
-            ("Solar Panel Kits at Lowes.com",
-             "https://www.lowes.com/pl/Solar-panel-kits-Solar-panels-accessories-Outdoor-living/4294410759"),
-            ("What Are Solar Panels? How Do They Work? - NREL", "https://www.nrel.gov/research/re-solar.html"),
-            ("Solar Energy and Solar Power Facts - National Geographic",
-             "https://www.nationalgeographic.com/environment/article/solar-power")
-        ]
-
-        output = [f"Search Results for: {' '.join(term)}", ""]
-        for i, (title, url) in enumerate(results, 1):
-            output.append(f"{i}. {title}")
-            output.append(f"   URL: {url}")
-            output.append("")
-
-        save_search_results([url for _, url in results])
-        output.append("To access a search result, use: go2web -u <URL> or go2web -u #<result-number>")
-
-        return '\n'.join(output)
-
-        # Format the output
-        output = [f"Search Results for: {' '.join(term)}", ""]
-        for i, (title, url) in enumerate(results, 1):
-            output.append(f"{i}. {title}")
-            output.append(f"   URL: {url}")
-            output.append("")
-
-        # Save the results for later access
-        save_search_results([url for _, url in results])
-
-        output.append("To access a search result, use: go2web -u <URL> or go2web -u #<result-number>")
-
-        return '\n'.join(output)
     except Exception as e:
         return f"Error performing search: {e}"
 
 
+def get_fallback_results():
+    return []
+
+
+def format_search_results(term, results):
+    """
+    Format search results for display.
+
+    Args:
+        term (list): The search terms that were used
+        results (list): List of (title, url) tuples
+
+    """
+    if not results:
+        return f"Search failed for: {' '.join(term)}. No results found."
+
+    output = [f"Search Results for: {' '.join(term)}", ""]
+
+    for i, (title, url) in enumerate(results, 1):
+        output.append(f"{i}. {title}")
+        output.append(f"   URL: {url}")
+        output.append("")
+
+    # Save the results for later access
+    save_search_results([url for _, url in results])
+
+    output.append("To access a search result, use: go2web -u <URL> or go2web -u #<result-number>")
+
+    return '\n'.join(output)
+
+
 def get_cache_path():
+    """
+    Get the path to the cache directory, creating it if needed.
+
+    """
     cache_dir = os.path.join(os.path.expanduser("~"), ".go2web_cache")
     if not os.path.exists(cache_dir):
         os.makedirs(cache_dir)
@@ -521,26 +541,54 @@ def get_cache_path():
 
 
 def get_cache_key(url):
+    """
+    Generate a cache key for a URL.
+
+    Returns str: MD5 hash of the URL
+
+    """
     return hashlib.md5(url.encode()).hexdigest()
 
 
+def is_cache_valid(cache_data):
+    """
+    Check if cached data is still valid.
+
+    Args:cache_data (dict): The cached data
+
+    """
+    return time.time() - cache_data['timestamp'] < CACHE_VALIDITY_SECONDS
+
+
 def get_from_cache(url):
+    """
+    Get a response from cache if available and valid.
+
+    """
     cache_path = get_cache_path()
     cache_key = get_cache_key(url)
     cache_file = os.path.join(cache_path, cache_key + ".json")
 
     if os.path.exists(cache_file):
-        with open(cache_file, 'r') as f:
-            cache_data = json.load(f)
+        try:
+            with open(cache_file, 'r') as f:
+                cache_data = json.load(f)
 
-        # Check if cache is still valid (1 hour validity)
-        if time.time() - cache_data['timestamp'] < 3600:
-            return cache_data['response']
+            # Check if cache is still valid
+            if is_cache_valid(cache_data):
+                return cache_data['response']
+        except (json.JSONDecodeError, KeyError):
+            # Invalid cache file
+            pass
 
     return None
 
 
 def save_to_cache(url, response):
+    """
+    Save a response to cache.
+
+    """
     cache_path = get_cache_path()
     cache_key = get_cache_key(url)
     cache_file = os.path.join(cache_path, cache_key + ".json")
@@ -555,6 +603,14 @@ def save_to_cache(url, response):
 
 
 def save_search_results(urls):
+    """
+    Save search results for later access by number.
+
+    Args:urls (list): List of URLs from search results
+    """
+    if not urls:
+        return
+
     cache_path = get_cache_path()
     cache_file = os.path.join(cache_path, "last_search_results.json")
 
@@ -563,6 +619,12 @@ def save_search_results(urls):
 
 
 def get_search_result_url(result_number):
+    """
+    Get a URL from search results by number.
+
+    Args:result_number (str): The result number with # prefix
+
+    """
     if not result_number.startswith('#'):
         return None
 
@@ -592,6 +654,23 @@ def get_search_result_url(result_number):
         print(f"Error accessing search result: {e}")
 
     return None
+
+
+def clear_cache_for_search(search_term):
+    """
+    Clear the cache for a specific search term.
+
+    """
+    cache_path = get_cache_path()
+    cache_key = get_cache_key(f"search:{search_term}")
+    cache_file = os.path.join(cache_path, cache_key + ".json")
+
+    if os.path.exists(cache_file):
+        try:
+            os.remove(cache_file)
+            print(f"Cache cleared for search: {search_term}")
+        except Exception as e:
+            print(f"Error clearing cache: {e}")
 
 
 def main():
@@ -647,20 +726,6 @@ def main():
         return 1
 
     return 0
-
-
-def clear_cache_for_search(search_term):
-    """Clear the cache for a specific search term"""
-    cache_path = get_cache_path()
-    cache_key = get_cache_key(f"search:{search_term}")
-    cache_file = os.path.join(cache_path, cache_key + ".json")
-
-    if os.path.exists(cache_file):
-        try:
-            os.remove(cache_file)
-            print(f"Cache cleared for search: {search_term}")
-        except:
-            pass
 
 
 if __name__ == '__main__':
